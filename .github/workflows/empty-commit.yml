@@ -1,4 +1,4 @@
-name: Vercel Deploy
+name: Add Empty Commit
 
 on:
   workflow_call:
@@ -22,7 +22,7 @@ on:
         required: false
 
 jobs:
-  vercel-deploy:
+  add-empty-commit:
     runs-on: ubuntu-latest
     
     steps:
@@ -38,7 +38,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
       
-      - name: Deploy to Vercel by creating empty commit with custom author and message
+      - name: Create empty commit
         run: |
           git commit --allow-empty --author "${{ inputs.author }}" -m "${{ inputs.message }}"
       
