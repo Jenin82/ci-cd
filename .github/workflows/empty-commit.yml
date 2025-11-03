@@ -3,20 +3,18 @@ name: Add Empty Commit
 on:
   workflow_call:
     inputs:
-      author:
-        description: 'Commit author in format "Name <email>"'
-        required: true
-        type: string
-      message:
-        description: 'Commit message'
-        required: true
-        type: string
       branch:
         description: 'Target branch (default: main)'
         required: false
         type: string
         default: 'main'
     secrets:
+      commit_author:
+        description: 'Commit author in format "Name <email>"'
+        required: true
+      commit_message:
+        description: 'Commit message'
+        required: true
       token:
         description: 'GitHub token with write permissions'
         required: false
@@ -40,7 +38,7 @@ jobs:
       
       - name: Create empty commit
         run: |
-          git commit --allow-empty --author "${{ inputs.author }}" -m "${{ inputs.message }}"
+          git commit --allow-empty --author "${{ secrets.commit_author }}" -m "${{ secrets.commit_message }}"
       
       - name: Push changes
         run: |
