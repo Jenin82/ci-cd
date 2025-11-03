@@ -1,0 +1,47 @@
+name: Vercel Deploy
+
+on:
+  workflow_call:
+    inputs:
+      author:
+        description: 'Commit author in format "Name <email>"'
+        required: true
+        type: string
+      message:
+        description: 'Commit message'
+        required: true
+        type: string
+      branch:
+        description: 'Target branch (default: main)'
+        required: false
+        type: string
+        default: 'main'
+    secrets:
+      token:
+        description: 'GitHub token with write permissions'
+        required: false
+
+jobs:
+  vercel-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.token || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Deploy to Vercel by creating empty commit with custom author and message
+        run: |
+          git commit --allow-empty --author "${{ inputs.author }}" -m "${{ inputs.message }}"
+      
+      - name: Push changes
+        run: |
+          git push origin ${{ inputs.branch }}
