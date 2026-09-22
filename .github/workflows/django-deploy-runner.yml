@@ -97,7 +97,9 @@ jobs:
           client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
           project-slug: ${{ github.event.client_payload.project_slug }}
           env-slug: ${{ github.event.client_payload.env_slug }}
-          domain: ${{ secrets.INFISICAL_DOMAIN }}
+          # An unset secret would pass "" and override the action's own default,
+          # failing with a confusing error instead of using US cloud.
+          domain: ${{ secrets.INFISICAL_DOMAIN || 'https://app.infisical.com' }}
           secret-path: /deploy
           export-type: env
 
