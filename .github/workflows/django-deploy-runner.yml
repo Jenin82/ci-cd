@@ -1,0 +1,280 @@
+# Required client_payload keys
+# repo, branch, pr, env_slug, restart_celery, project_slug
+#
+# The droplet IP and public hostname come from the Infisical `/deploy` folder of the
+# target environment. `export-type: env` is deliberate: that branch of the action calls
+# core.setSecret() on every imported value, so the IP is masked as *** in all logs.
+# `export-type: file` does NOT mask, and this repo is public.
+
+name: "Django Branch Deploy"
+run-name: "Django deploy → ${{ github.event.client_payload.env_slug }}"
+
+on:
+  repository_dispatch:
+    types: [django-deploy]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: ${{ github.event.client_payload.repo == 'Jenin82/vkgadonai-backend' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: django-deploy-${{ github.event.client_payload.repo }}-${{ github.event.client_payload.env_slug }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate payload
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.client_payload.branch }}
+          ENV_SLUG: ${{ github.event.client_payload.env_slug }}
+          PR: ${{ github.event.client_payload.pr }}
+          PROJECT_SLUG: ${{ github.event.client_payload.project_slug }}
+        run: |
+          set -euo pipefail
+          case "$BRANCH" in ''|*[!A-Za-z0-9._/-]*) echo "Invalid branch" >&2; exit 1;; esac
+          case "$ENV_SLUG" in staging|prod) ;; *) echo "Invalid env slug" >&2; exit 1;; esac
+          case "$PR" in ''|*[!0-9]*) echo "Invalid PR number" >&2; exit 1;; esac
+          case "$PROJECT_SLUG" in ''|*[!A-Za-z0-9-]*) echo "Invalid project slug" >&2; exit 1;; esac
+
+      - name: Purge previous comments from this workflow
+        uses: actions/github-script@v8
+        env:
+          PAYLOAD_REPO: ${{ github.event.client_payload.repo }}
+          PAYLOAD_PR: ${{ github.event.client_payload.pr }}
+          PAYLOAD_ENV: ${{ github.event.client_payload.env_slug }}
+        with:
+          github-token: ${{ secrets.PR_COMMENT_TOKEN }}
+          script: |
+            const [owner, repo] = process.env.PAYLOAD_REPO.split("/");
+            const issue_number = Number(process.env.PAYLOAD_PR);
+            const marker = `<!-- django-deploy-${process.env.PAYLOAD_ENV} -->`;
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 }
+            );
+            let deleted = 0;
+            for (const c of comments) {
+              if ((c.body || "").includes(marker)) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
+                deleted++;
+              }
+            }
+            core.info(`Deleted ${deleted} prior django-deploy comments`);
+
+      - name: Comment deploy started
+        uses: peter-evans/create-or-update-comment@v5
+        id: status
+        with:
+          edit-mode: "replace"
+          token: ${{ secrets.PR_COMMENT_TOKEN }}
+          repository: ${{ github.event.client_payload.repo }}
+          issue-number: ${{ github.event.client_payload.pr }}
+          body: |
+            <!-- django-deploy-${{ github.event.client_payload.env_slug }} -->
+            🏗️ Deploying `${{ github.event.client_payload.branch }}` to ${{ github.event.client_payload.env_slug }}.
+            Watch progress [here](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+      - name: Create SSH key
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/private.key
+          chmod 600 ~/.ssh/private.key
+
+      # Only the `/deploy` folder is imported: it holds HOST (public hostname, used for
+      # the healthcheck URL) and IP (the ssh target). Both arrive as masked env vars.
+      - name: Import deploy secrets from Infisical
+        uses: Infisical/secrets-action@v1.0.15
+        with:
+          method: universal
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          project-slug: ${{ github.event.client_payload.project_slug }}
+          env-slug: ${{ github.event.client_payload.env_slug }}
+          domain: ${{ secrets.INFISICAL_DOMAIN }}
+          secret-path: /deploy
+          export-type: env
+
+      # Re-binding HOST/IP in a step-level `env:` block would render them in the log's
+      # env section, so every step below reads them straight from the job environment.
+      - name: Verify deploy secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${HOST:-}" ] || { echo "HOST missing from Infisical /deploy folder" >&2; exit 1; }
+          [ -n "${IP:-}" ]   || { echo "IP missing from Infisical /deploy folder" >&2; exit 1; }
+
+      - name: Add host to known_hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh-keyscan -H "$IP" >> ~/.ssh/known_hosts
+
+      - name: Create SSH script
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '#!/bin/bash\nssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -i ~/.ssh/private.key "ubuntu@%s" "$@"\n' "$IP" > s.sh
+          # This repo is public, so remote output (image digests, migration names,
+          # tracebacks) is withheld on success and only shown when a command fails.
+          cat > run.sh <<'EOF'
+          #!/bin/bash
+          label="$1"; shift
+          out=$(mktemp)
+          if ./s.sh "$@" >"$out" 2>&1; then
+            echo "$label: ok"
+            rm -f "$out"
+          else
+            rc=$?
+            echo "$label: FAILED -- remote output follows" >&2
+            cat "$out" >&2
+            rm -f "$out"
+            exit "$rc"
+          fi
+          EOF
+          chmod +x s.sh run.sh
+
+      # Swarm only reports a task as `1/1` once that container's own healthcheck passes
+      # (`health server` / `health celery worker|beat`), so these waits prove the service
+      # itself is up; the final HTTPS probe additionally proves DNS/TLS/proxy are good.
+      - name: Create converge script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > converge.sh <<'EOF'
+          STACK=$(docker stack ls --format '{{.Name}}' | head -n 1)
+          SVC="${STACK}_$1"
+          docker service inspect "$SVC" >/dev/null 2>&1 || { echo "service $SVC does not exist" >&2; exit 1; }
+          for _ in $(seq 1 36); do
+            state=$(docker service inspect --format '{{.UpdateStatus.State}}' "$SVC" 2>/dev/null || true)
+            reps=$(docker service ls --filter "name=$SVC" --format '{{.Replicas}}')
+            cur=${reps%%/*}; want=${reps##*/}
+            case "$state" in
+              updating) ;;
+              *)
+                # Converged replicas win over the status flag. `paused` is the default
+                # update_config.failure_action and only clears on a spec change, which a
+                # no-op redeploy is not -- failing on it while the service is healthy
+                # would wedge every later deploy before the restart that could fix it.
+                if [ -n "$cur" ] && [ "$cur" = "$want" ] && [ "$cur" != "0" ]; then
+                  case "$state" in
+                    ""|completed) ;;
+                    *) echo "WARNING: $1 is healthy but its last update ended in $state" ;;
+                  esac
+                  echo "$1 converged ($reps, update=${state:-none})"
+                  exit 0
+                fi
+                # Replicas short AND the update is in a terminal state: it will not
+                # recover on its own, so fail now instead of waiting out the 180s.
+                case "$state" in
+                  paused|rollback_started|rollback_paused|rollback_completed)
+                    echo "$1 stuck (state=$state, $reps); resolve it on the droplet" >&2
+                    exit 1 ;;
+                esac ;;
+            esac
+            echo "waiting for $1: ${reps:-?} update=${state:-none}"
+            sleep 5
+          done
+          echo "$1 did not converge within 180s" >&2
+          exit 1
+          EOF
+
+      - name: Deploy
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.client_payload.branch }}
+          ENV_SLUG: ${{ github.event.client_payload.env_slug }}
+        run: |
+          set -euo pipefail
+          ./run.sh "deploy" "deploy $BRANCH --env $ENV_SLUG"
+
+      - name: Wait for server to converge
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `docker stack deploy -d` returns before swarm flips UpdateStatus.State to
+          # `updating`, so a stale `completed` from the previous deploy could pass at t=0.
+          sleep 5
+          ./s.sh 'bash -s server' < converge.sh
+
+      - name: Run migrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The `1` answers shell.sh's bash `select` prompt when the service has more than
+          # one running task; with a single task `docker exec` runs without -i and it is discarded.
+          printf '1\n' | ./run.sh "migrate" "shell server run python manage.py migrate --noinput"
+
+      # Always restart: app source is bind-mounted into a `preload_app` Gunicorn, so a
+      # no-op stack deploy would otherwise leave the old code serving the new migrations.
+      - name: Restart server
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./run.sh "restart server" "shell server restart"
+          ./s.sh 'bash -s server' < converge.sh
+
+      - name: Restart celery
+        if: ${{ github.event.client_payload.restart_celery == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This stack has no `celery` service (db/redis/server/worker/beat), so beat and
+          # worker are restarted directly with no `shell celery restart` attempt.
+          ./run.sh "restart beat" "shell beat restart"
+          ./run.sh "restart worker" "shell worker restart"
+          ./s.sh 'bash -s beat' < converge.sh
+          ./s.sh 'bash -s worker' < converge.sh
+
+      - name: Wait for healthcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout=120
+          interval=5
+          elapsed=0
+          url="https://$HOST/healthcheck/"
+
+          until curl --fail --silent --show-error --max-time 5 -o /dev/null "$url"; do
+            if [ $elapsed -ge $timeout ]; then
+              echo "Healthcheck did not pass within ${timeout}s of polling"
+              exit 1
+            fi
+            echo "Waiting for healthcheck ($elapsed/$timeout)..."
+            sleep $interval
+            elapsed=$((elapsed + interval))
+          done
+          echo "Server is healthy."
+
+      - name: Comment deploy succeeded
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          token: ${{ secrets.PR_COMMENT_TOKEN }}
+          repository: ${{ github.event.client_payload.repo }}
+          issue-number: ${{ github.event.client_payload.pr }}
+          comment-id: ${{ steps.status.outputs.comment-id }}
+          edit-mode: "replace"
+          body: |
+            <!-- django-deploy-${{ github.event.client_payload.env_slug }} -->
+            ✅ Deployed `${{ github.event.client_payload.branch }}` to ${{ github.event.client_payload.env_slug }}
+            Server restarted; celery restarted: ${{ github.event.client_payload.restart_celery }}
+
+      - name: Comment deploy failed
+        if: ${{ failure() || cancelled() }}
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          token: ${{ secrets.PR_COMMENT_TOKEN }}
+          repository: ${{ github.event.client_payload.repo }}
+          issue-number: ${{ github.event.client_payload.pr }}
+          comment-id: ${{ steps.status.outputs.comment-id }}
+          edit-mode: "replace"
+          body: |
+            <!-- django-deploy-${{ github.event.client_payload.env_slug }} -->
+            ❌ Deploy failed or was cancelled for ${{ github.event.client_payload.env_slug }}
+            [Check logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})

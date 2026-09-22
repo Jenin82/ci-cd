@@ -1,0 +1,65 @@
+name: "Django Branch Deploy Trigger"
+
+on:
+  workflow_call:
+    inputs:
+      project_slug:
+        description: 'Infisical project slug'
+        required: true
+        type: string
+    secrets:
+      dispatch_token:
+        required: true
+
+permissions:
+  pull-requests: write
+  deployments: write
+  contents: write
+  checks: read
+  statuses: read
+
+jobs:
+  trigger-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: github/branch-deploy@v11
+        id: branch-deploy
+        with:
+          environment: "staging"
+          environment_targets: "staging,prod"
+          update_branch: 'disabled'
+          # allow_forks defaults to "true". A fork branch is not on the droplet's origin,
+          # so deploy.sh would either fail or -- worse, for a name like `dev` -- resolve
+          # refs/remotes/origin/<name> and deploy upstream's code under the fork's name.
+          allow_forks: "false"
+
+      - name: Decide restart targets
+        id: targets
+        if: ${{ steps.branch-deploy.outputs.continue == 'true' && steps.branch-deploy.outputs.noop != 'true' }}
+        shell: bash
+        env:
+          PARAMS: ${{ steps.branch-deploy.outputs.params }}
+        run: |
+          set -euo pipefail
+          # `server` is always restarted, so only `celery` is parsed. A comment that
+          # still says `| server` is harmless.
+          celery=false
+          if grep -qiE '(^|[[:space:]])celery([[:space:]]|$)' <<<"$PARAMS"; then celery=true; fi
+          echo "celery=$celery" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch to ci-cd repo
+        if: ${{ steps.branch-deploy.outputs.continue == 'true' && steps.branch-deploy.outputs.noop != 'true' }}
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.dispatch_token }}
+          repository: Jenin82/ci-cd
+          event-type: django-deploy
+          client-payload: >-
+            {
+              "repo": ${{ toJSON(github.repository) }},
+              "branch": ${{ toJSON(steps.branch-deploy.outputs.ref) }},
+              "pr": ${{ toJSON(steps.branch-deploy.outputs.issue_number) }},
+              "env_slug": ${{ toJSON(steps.branch-deploy.outputs.environment) }},
+              "restart_celery": ${{ toJSON(steps.targets.outputs.celery) }},
+              "project_slug": ${{ toJSON(inputs.project_slug) }}
+            }
