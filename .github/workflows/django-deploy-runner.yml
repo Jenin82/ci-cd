@@ -75,7 +75,7 @@ jobs:
           body: |
             <!-- django-deploy-${{ github.event.client_payload.env_slug }} -->
             🏗️ Deploying `${{ github.event.client_payload.branch }}` to ${{ github.event.client_payload.env_slug }}.
-            Watch progress [here](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            [▶ Follow the deploy run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
       - name: Create SSH key
         shell: bash
@@ -266,6 +266,7 @@ jobs:
             <!-- django-deploy-${{ github.event.client_payload.env_slug }} -->
             ✅ Deployed `${{ github.event.client_payload.branch }}` to ${{ github.event.client_payload.env_slug }}
             Server restarted; celery restarted: ${{ github.event.client_payload.restart_celery }}
+            [▶ Deploy run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
       - name: Comment deploy failed
         if: ${{ failure() || cancelled() }}
@@ -279,4 +280,4 @@ jobs:
           body: |
             <!-- django-deploy-${{ github.event.client_payload.env_slug }} -->
             ❌ Deploy failed or was cancelled for ${{ github.event.client_payload.env_slug }}
-            [Check logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            [▶ Deploy run and logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
