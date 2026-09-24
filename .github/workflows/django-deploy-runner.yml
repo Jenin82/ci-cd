@@ -128,12 +128,39 @@ jobs:
           cat > run.sh <<'EOF'
           #!/bin/bash
           label="$1"; shift
-          out=$(mktemp)
+          out=$(mktemp) || exit 1
           if ./s.sh "$@" >"$out" 2>&1; then
             echo "$label: ok"
             rm -f "$out"
           else
             rc=$?
+            if [ "$label" = deploy ] && grep -Fq 'error: unable to create temporary file: No space left on device' "$out"; then
+              echo "deploy: disk full on server; pruning unused Docker data and retrying once"
+              prune_out=$(mktemp) || { rm -f "$out"; exit 1; }
+              if ./s.sh 'docker system prune -a -f' >"$prune_out" 2>&1; then
+                if ./s.sh "$@" >"$prune_out" 2>&1; then
+                  echo "deploy: ok after Docker prune"
+                  rm -f "$out" "$prune_out"
+                  exit 0
+                else
+                  rc=$?
+                  echo "deploy: initial failure -- remote output follows" >&2
+                  cat "$out" >&2
+                  echo "deploy: retry FAILED -- remote output follows" >&2
+                  cat "$prune_out" >&2
+                  rm -f "$out" "$prune_out"
+                  exit "$rc"
+                fi
+              else
+                rc=$?
+                echo "deploy: initial failure -- remote output follows" >&2
+                cat "$out" >&2
+                echo "Docker prune: FAILED -- remote output follows" >&2
+                cat "$prune_out" >&2
+                rm -f "$out" "$prune_out"
+                exit "$rc"
+              fi
+            fi
             echo "$label: FAILED -- remote output follows" >&2
             cat "$out" >&2
             rm -f "$out"
