@@ -1,0 +1,171 @@
+# Shared Vinext Workers deployment
+
+The public runner contains deployment logic only. Each source repository owns its
+`wrangler.jsonc`, `package.json`, and caller workflow. The caller may supply an
+Infisical project slug when the app needs environment values, or omit it for an
+app with no build variables or runtime secrets.
+No project registry or deployment manifest is stored here.
+
+| Source branch | Wrangler environment | Infisical environment | Runner action |
+| --- | --- | --- | --- |
+| `dev` with source `previews` block | `staging` build plus native Preview `stg` | `staging` | Deploy a Worker Preview with staging secrets |
+| `dev` without source `previews` block | `staging` | `staging` | Upload a version with preview alias `dev` |
+| `main` | `production` | `prod` | Deploy the active production version |
+
+A main-only project omits `staging` in `wrangler.jsonc` and triggers only on
+`main`. The branch selects the environment; the dispatch cannot override it.
+
+## Source repository contract
+
+- The repository belongs to `Jenin82`, has root `package.json` and
+  `wrangler.jsonc`, and keeps `wrangler.jsonc` in the strict JSON subset of
+  JSONC. Both files are fetched through the GitHub API at the exact dispatched
+  commit. The runner checks that this commit remains the branch head.
+- `package.json` pins `packageManager` and an exact `wrangler` version. It has
+  `check:deploy` and `build:vinext` scripts. The build emits `dist/server/wrangler.json`
+  and `dist/client`. The runner uses Node 24 and frozen dependency installs.
+- `wrangler.jsonc` declares the account, Worker, and each deployed environment.
+  It is the sole source of the deployment destination. Environments must
+  target the same account and Worker. Declare resource
+  bindings inside each environment because Cloudflare does not inherit them.
+  The generated config is compared against this source configuration, then
+  sanitized to a deployment-only bundle; executable hooks and routes are
+  discarded.
+- For native Worker Previews, add a top-level `previews` block and pin Wrangler
+  4.135.0 or later. The top level contains production bindings; `previews`
+  contains staging bindings. Retain `env.staging` and `env.production` for the
+  Vinext build, with matching bindings. The runner validates both source and
+  generated configuration and uses the stable Preview name `stg` for `dev`.
+  Without a `previews` block, the existing version-alias path is unchanged.
+- Native Preview projects derive runtime secret names from the selected
+  Infisical environment. The runner writes those names into top-level
+  `secrets.required` in the sanitized bundle. Production deploy and Preview
+  deployment both pass a temporary `--secrets-file` to the pinned Wrangler,
+  so the secrets are included with the deployment. Preview deployment uses
+  `--ignore-base-config` so dashboard Base settings cannot add bindings or secrets.
+  Native projects must not declare plaintext `vars` at the top level, in
+  `previews`, or in either Vinext environment. The runner rejects generated
+  plaintext `vars` and checks the deployed Preview's unique tag, secret names,
+  and types through Cloudflare's API. Wrangler's asset progress shares stdout
+  with `preview --json`, so stdout is not used for verification.
+- The source workflow calls
+  `Jenin82/ci-cd/.github/workflows/vinext-deploy-trigger.yml@main`. The
+  `project_slug` input is optional. It passes `CENTRAL_DISPATCH_TOKEN` as the
+  reusable workflow secret.
+
+## D1 migrations
+
+D1 migrations are explicit and source-owned. A target opts in by setting
+`migrations_dir` on its `d1_databases` entry. The directory must remain beneath
+the application working directory and contain only 1-100 nonempty, top-level
+`.sql` files, with each file at most 1 MiB and the full set at most 10 MiB.
+Symlinks, nested directories, non-SQL files, duplicate bindings, and duplicate
+database identities are rejected. A D1 binding without `migrations_dir` is left
+untouched.
+
+The build runner copies those files into a reserved artifact directory and
+records their SHA-256 hashes. The deploy runner validates the files again and
+uses the project's pinned Wrangler to run `d1 migrations apply --remote` for
+each configured target database, in stable binding order, before uploading the
+Worker. Wrangler's configured migration ledger (the `d1_migrations` table by
+default) provides idempotency and Cloudflare captures its normal migration
+backup. The deploy runner then rechecks that the source commit is still current
+before upload. Migration files must therefore be backward-compatible with the
+currently deployed Worker: a migration can finish before a later upload fails
+or becomes superseded.
+
+Wrangler and application frameworks may use separate migration ledgers. Each
+SQL migration is responsible for updating any framework-specific ledger in the
+same file. Never edit, rename, or reorder an applied SQL migration; add a new
+forward migration. A migrated D1 database must be exclusive to one centrally
+deployed Worker because serialization is keyed by account and Worker, not by
+database identity.
+
+The CI GitHub App needs read access to the source repository and any private
+submodules. The build checkout token is read-only and scoped to the source repo plus
+the submodules declared at the dispatched commit. It remains during the job for recursive
+submodule cleanup. Source maintainers control the Worker target in
+`wrangler.jsonc` and the Infisical project slug in the caller workflow. The
+central Cloudflare token must be scoped to the Workers and accounts these
+maintainers may deploy; the runner does not authorize the destination through
+Infisical. Scope the Infisical machine identity to the intended projects.
+
+## Infisical contract
+
+Omit `project_slug` (or pass an empty string) for an app without environment
+values. The runner skips Infisical authentication and network access and exports
+empty build/runtime JSON snapshots. It still validates the source Worker,
+account, bindings, exact commit, and deployment state. Both configuration lists
+must remain empty; omitting the slug cannot bypass required variables or secrets.
+Existing callers with a nonempty slug keep their Infisical behavior unchanged.
+
+When a slug is supplied, the runner reads the caller's project, environment
+`staging` or `prod`, path
+`/`. It classifies the values as follows:
+
+- App build variables prefixed `NEXT_PUBLIC_`. These are passed to the build
+  and embedded into browser assets. Blank or whitespace-only values are ignored.
+- Every other value becomes a Worker runtime secret automatically, including
+  `VINEXT_*` keys and values imported into this Infisical environment. Runtime
+  values that are blank or whitespace-only are ignored. Invalid or system-reserved variable names fail
+  preparation to prevent runner environment shadowing. Runtime names also may
+  not collide with Worker resource or asset binding names.
+
+The runner reads `.gitmodules` from the exact source commit. Submodules must
+use same-owner GitHub URLs and have pinned gitlinks. The checkout token
+is scoped to the source repo plus the listed submodule repositories. Nested
+private submodules need separate support before they can be checked out.
+
+No build-variable or runtime-secret name lists are required. Local
+`.env*` and `.dev.vars*` files in the repository root are removed from the
+fresh CI checkout before building. Environment files are excluded from the
+deployment artifact. If nonempty Infisical key names change between preparation and
+build or deploy, the run fails so a new run can capture the complete set.
+
+The legacy alias path requires an initial active Worker deployment before the
+shared runner can update it. Native Previews can be created before the first
+production deployment. The runner checks that a native Preview does not change
+an existing production deployment. The runner does not
+create KV or R2 resources; source `wrangler.jsonc` must refer to existing
+resources. Vinext's optional `VINEXT_KV_CACHE` binding is unnecessary when its
+default in-memory cache is acceptable. App-data KV or R2 bindings remain valid.
+
+The public run title and summary show the source repository and target
+environment. The runner masks private Infisical values during plan resolution
+and masks all exported values before build or deploy commands run. Metadata
+keys, account/Worker identifiers, and secret names are not credentials.
+API errors exclude response bodies, and temporary secret JSON is deleted.
+
+The central run reports `vinext/staging` or `vinext/production` on the source
+commit. The caller job only confirms dispatch. A successful central run means
+Cloudflare accepted the upload and the runner verified the resulting version
+and deployment state. For native Previews it checks Wrangler's deployment ID,
+Preview URL, and an unchanged active production deployment. It does not report
+application health. Domain changes
+and authenticated UI checks are separate rollout steps.
+
+## Central repository setup
+
+Configure these Actions secrets in `Jenin82/ci-cd` before running deployments:
+
+- `CI_APP_CLIENT_ID` and `CI_APP_PRIVATE_KEY`: a GitHub App installed on the
+  source repositories and private submodules, with Contents read and Commit
+  statuses write permissions. Checkout tokens request only Contents read.
+- `CLOUDFLARE_API_TOKEN`: access to the configured accounts and Workers;
+  also D1 Edit when the source opts into remote D1 migrations.
+- `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET`: required only when a
+  caller supplies `project_slug`. Also set `INFISICAL_DOMAIN` to the HTTPS
+  Infisical host URL when using a slug; the helper has no default host.
+
+In each source repo, configure `CENTRAL_DISPATCH_TOKEN` with permission to
+send repository dispatches to `Jenin82/ci-cd`, and copy
+`triggers/vinext-trigger.yml` into `.github/workflows/`. Set `project_slug`
+or omit it for an app without environment values. The template supports
+pushes and manual runs on `dev` or `main`. The reusable trigger and runner
+must be present on the central repository's default branch before dispatch.
+
+The runner downloads its six control modules from `Jenin82/ci-cd` at the
+central run's exact commit SHA. These unauthenticated downloads require
+this central repository to be public. Keep workflow and helper changes together.
+Imported from `Lascade-Co/actions` at commit
+`da8bfb44b5ee9782f3511b5f23fdb4140d2f14b6`, adapted for `Jenin82` only.

@@ -1,0 +1,19 @@
+# Copy into the application's .github/workflows/deploy.yml after configuring
+# its wrangler.jsonc, Infisical metadata, and CENTRAL_DISPATCH_TOKEN.
+name: Deploy Vinext
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    uses: Jenin82/ci-cd/.github/workflows/vinext-deploy-trigger.yml@main
+    with:
+      project_slug: your-infisical-project-slug
+    secrets:
+      central_dispatch_token: ${{ secrets.CENTRAL_DISPATCH_TOKEN }}
