@@ -39,6 +39,17 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "Invalid PR number" >&2; exit 1;; esac
           case "$PROJECT_SLUG" in ''|*[!A-Za-z0-9-]*) echo "Invalid project slug" >&2; exit 1;; esac
 
+      - name: Download Django deployment control at the runner commit
+        shell: bash
+        env:
+          CONTROL_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p control/scripts/django
+          curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 60 --connect-timeout 10 --max-time 20 "https://raw.githubusercontent.com/Jenin82/ci-cd/$CONTROL_SHA/scripts/django/deploy.py" -o control/scripts/django/deploy.py.tmp
+          test -s control/scripts/django/deploy.py.tmp
+          mv control/scripts/django/deploy.py.tmp control/scripts/django/deploy.py
+
       - name: Purge previous comments from this workflow
         uses: actions/github-script@v8
         env:
@@ -127,9 +138,19 @@ jobs:
           # tracebacks) is withheld on success and only shown when a command fails.
           cat > run.sh <<'EOF'
           #!/bin/bash
+          set +x
+          set -euo pipefail
           label="$1"; shift
+          invoke_remote() {
+            if [ "$label" = deploy ]; then
+              [ -n "${DEPLOY_INFISICAL_TOKEN:-}" ] || { echo "Fresh Infisical deployment token missing" >&2; return 1; }
+              printf '%s\n' "$DEPLOY_INFISICAL_TOKEN" | ./s.sh "$@"
+            else
+              ./s.sh "$@"
+            fi
+          }
           out=$(mktemp) || exit 1
-          if ./s.sh "$@" >"$out" 2>&1; then
+          if invoke_remote "$@" >"$out" 2>&1; then
             echo "$label: ok"
             rm -f "$out"
           else
@@ -138,7 +159,7 @@ jobs:
               echo "deploy: disk full on server; pruning unused Docker data and retrying once"
               prune_out=$(mktemp) || { rm -f "$out"; exit 1; }
               if ./s.sh 'docker system prune -a -f' >"$prune_out" 2>&1; then
-                if ./s.sh "$@" >"$prune_out" 2>&1; then
+                if invoke_remote "$@" >"$prune_out" 2>&1; then
                   echo "deploy: ok after Docker prune"
                   rm -f "$out" "$prune_out"
                   exit 0
@@ -219,9 +240,12 @@ jobs:
         env:
           BRANCH: ${{ github.event.client_payload.branch }}
           ENV_SLUG: ${{ github.event.client_payload.env_slug }}
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          INFISICAL_DOMAIN: ${{ secrets.INFISICAL_DOMAIN || 'https://app.infisical.com' }}
         run: |
           set -euo pipefail
-          ./run.sh "deploy" "deploy $BRANCH --env $ENV_SLUG"
+          python3 control/scripts/django/deploy.py
 
       - name: Wait for server to converge
         shell: bash

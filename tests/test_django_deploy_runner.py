@@ -10,6 +10,7 @@ import unittest
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/django-deploy-runner.yml"
 REMOTE_COMMAND = "deploy main --env staging"
 PRUNE_COMMAND = "docker system prune -a -f"
+TOKEN = "fresh-test-token$literal;\"quote"
 
 
 def generated_run_script():
@@ -24,6 +25,7 @@ def generated_run_script():
 STUB = """#!/bin/bash
 printf '%s\\n' "$*" >> "$CALLS"
 count=$(( $(wc -l < "$CALLS") ))
+cat > "$INPUTS/$count"
 case "$SCENARIO:$count" in
   success:1|disk_full_retry:3)
     echo 'private deploy success details'
@@ -54,7 +56,7 @@ exit 99
 
 
 class DeployRunnerTests(unittest.TestCase):
-    def run_scenario(self, scenario, label="deploy"):
+    def run_scenario(self, scenario, label="deploy", token=TOKEN, stdin=""):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "run.sh").write_text(generated_run_script())
@@ -62,21 +64,30 @@ class DeployRunnerTests(unittest.TestCase):
             (root / "run.sh").chmod(0o755)
             (root / "s.sh").chmod(0o755)
             calls = root / "calls"
-            env = {**os.environ, "SCENARIO": scenario, "CALLS": str(calls)}
+            inputs = root / "inputs"
+            inputs.mkdir()
+            env = {
+                **os.environ, "SCENARIO": scenario, "CALLS": str(calls),
+                "INPUTS": str(inputs), "DEPLOY_INFISICAL_TOKEN": token,
+            }
             result = subprocess.run(
                 ["./run.sh", label, REMOTE_COMMAND],
                 cwd=root,
                 env=env,
                 capture_output=True,
+                input=stdin,
                 text=True,
                 check=False,
             )
-            return result, calls.read_text().splitlines()
+            self.remote_inputs = [path.read_text() for path in sorted(inputs.iterdir())]
+            return result, calls.read_text().splitlines() if calls.exists() else []
 
     def test_success_hides_remote_output(self):
         result, calls = self.run_scenario("success")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(calls, [REMOTE_COMMAND])
+        self.assertEqual(self.remote_inputs, [TOKEN + "\n"])
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "deploy: ok\n")
         self.assertEqual(result.stderr, "")
 
@@ -84,6 +95,8 @@ class DeployRunnerTests(unittest.TestCase):
         result, calls = self.run_scenario("disk_full_retry")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(calls, [REMOTE_COMMAND, PRUNE_COMMAND, REMOTE_COMMAND])
+        self.assertEqual(self.remote_inputs, [TOKEN + "\n", "", TOKEN + "\n"])
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
         self.assertIn("pruning unused Docker data", result.stdout)
         self.assertIn("deploy: ok after Docker prune", result.stdout)
         self.assertNotIn("private", result.stdout + result.stderr)
@@ -125,6 +138,18 @@ class DeployRunnerTests(unittest.TestCase):
         self.assertEqual(calls, [REMOTE_COMMAND])
         self.assertIn("error: unable to create temporary file: No space left on device", result.stderr)
         self.assertIn("migrate: FAILED", result.stderr)
+
+    def test_missing_deployment_token_never_invokes_ssh(self):
+        result, calls = self.run_scenario("success", token="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("Fresh Infisical deployment token missing", result.stderr)
+
+    def test_migration_selection_stdin_is_preserved(self):
+        result, calls = self.run_scenario("success", label="migrate", stdin="1\n")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(calls, [REMOTE_COMMAND])
+        self.assertEqual(self.remote_inputs, ["1\n"])
 
 
 if __name__ == "__main__":
