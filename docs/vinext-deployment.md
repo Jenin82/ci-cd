@@ -53,6 +53,35 @@ A main-only project omits `staging` in `wrangler.jsonc` and triggers only on
   `project_slug` input is optional. It passes `CENTRAL_DISPATCH_TOKEN` as the
   reusable workflow secret.
 
+## Staging Durable Object migrations
+
+Native `dev` Previews may opt into source-owned SQLite Durable Object class
+creation through top-level `migrations`, for example:
+
+```json
+[{ "tag": "vkg-mail-v1", "new_sqlite_classes": ["MailDispatcher"] }]
+```
+
+Declare local `name`/`class_name` bindings under both `previews.durable_objects`
+and `env.staging.durable_objects`. Created classes must be bound in the Preview
+and absent from production bindings. Imported scripts/namespaces, legacy
+`new_classes`, rename/delete/transfer operations, and SQL are rejected. Tags and
+created classes must be unique; each of at most 100 entries creates 1-100
+classes. Preserve applied entries and append new migrations.
+
+The runner captures the exact source migration list, compares generated files
+against it during build and deploy, and retains it at the sanitized bundle's top
+level for `wrangler preview --name stg --ignore-base-config`. Cloudflare applies
+these migrations to the Preview's isolated namespaces. Production resource
+binding restoration is unchanged. Nonempty Durable Object migrations are
+rejected for production and legacy alias deployments; a future production
+Durable Object rollout needs separate support. Existing projects without such
+migrations keep their deployment behavior.
+
+Run `node --test tests/vinext-preview-migrations.test.mjs` for the configuration
+and artifact regressions. The same six control modules remain the complete
+workflow download set.
+
 ## D1 migrations
 
 D1 migrations are explicit and source-owned. A target opts in by setting

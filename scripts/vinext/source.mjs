@@ -1,4 +1,4 @@
-import { assert, bindingKeys, nonemptyValues, validateDispatch } from './config.mjs';
+import { assert, bindingKeys, nonemptyValues, validateDispatch, validatePreviewMigrations } from './config.mjs';
 
 const noPlainVars = source => source.vars === undefined || (source.vars && typeof source.vars === 'object' && !Array.isArray(source.vars) && Object.keys(source.vars).length === 0);
 
@@ -118,6 +118,13 @@ export function projectFromSource(payload, { pkg, wrangler, submodule_repos }, v
     environments.staging.bindings = previewBindings;
     environments.production.bindings = productionBindings;
   }
+  const previewMigrations = validatePreviewMigrations(wrangler.migrations, {
+    nativePreview, target, previewBindings: environments.staging?.bindings,
+    productionBindings: { durable_objects: { bindings: [
+      ...(wrangler.durable_objects?.bindings ?? []),
+      ...(wrangler.env?.production?.durable_objects?.bindings ?? []),
+    ] } },
+  });
   return {
     account_id: topAccount, worker_name: topName, node_version: '24',
     asset_binding: wrangler.assets?.binding ?? 'ASSETS',
@@ -127,6 +134,7 @@ export function projectFromSource(payload, { pkg, wrangler, submodule_repos }, v
     build_variables: build, runtime_secrets: runtime,
     preview_mode: nativePreview ? 'native' : 'alias', preview_name: nativePreview ? 'stg' : undefined,
     preview_config: nativePreview ? wrangler.previews : undefined,
+    ...(previewMigrations.length ? { preview_migrations: previewMigrations } : {}),
     environments,
   };
 }

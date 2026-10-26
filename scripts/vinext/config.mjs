@@ -39,6 +39,46 @@ function resourceBindingNames(bindings) {
   return names;
 }
 
+// Native Previews create their own namespaces. Only additive SQLite class
+// creation is supported here; production Durable Object rollout is separate.
+export function validatePreviewMigrations(migrations, { nativePreview, target, previewBindings, productionBindings }) {
+  if (migrations === undefined) return [];
+  assert(Array.isArray(migrations) && migrations.length <= 100, 'Durable Object migrations must be an array of at most 100 entries');
+  if (!migrations.length) return [];
+  assert(nativePreview && target === 'staging', 'Durable Object migrations are supported only for native staging Previews');
+  const bindings = previewBindings?.durable_objects?.bindings;
+  assert(Array.isArray(bindings) && bindings.length > 0, 'Durable Object migrations require Preview bindings');
+  const names = new Set(), boundClasses = new Set();
+  for (const binding of bindings) {
+    assert(binding && typeof binding === 'object' && !Array.isArray(binding) &&
+      Object.keys(binding).every(key => ['name', 'class_name'].includes(key)) &&
+      /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(binding.name ?? '') &&
+      /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(binding.class_name ?? ''),
+    'Migrated Preview Durable Objects must use local name/class_name bindings without imported scripts or namespaces');
+    assert(!names.has(binding.name), 'Duplicate Preview Durable Object binding');
+    names.add(binding.name);
+    boundClasses.add(binding.class_name);
+  }
+  const productionClasses = new Set((productionBindings?.durable_objects?.bindings ?? []).map(binding => binding.class_name));
+  const tags = new Set(), classes = new Set();
+  return migrations.map(migration => {
+    assert(migration && typeof migration === 'object' && !Array.isArray(migration) &&
+      Object.keys(migration).length === 2 && Object.hasOwn(migration, 'tag') && Object.hasOwn(migration, 'new_sqlite_classes'),
+    'Only tag and new_sqlite_classes are supported in Preview Durable Object migrations');
+    assert(typeof migration.tag === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(migration.tag) && !tags.has(migration.tag), 'Invalid or duplicate Preview Durable Object migration tag');
+    tags.add(migration.tag);
+    assert(Array.isArray(migration.new_sqlite_classes) && migration.new_sqlite_classes.length > 0 && migration.new_sqlite_classes.length <= 100, 'Each Preview migration must create 1-100 SQLite Durable Object classes');
+    const created = migration.new_sqlite_classes.map(name => {
+      assert(typeof name === 'string' && /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(name) &&
+        boundClasses.has(name) && !classes.has(name) && !productionClasses.has(name),
+      'Migrated classes must be unique, locally bound Preview classes absent from production');
+      classes.add(name);
+      return name;
+    });
+    return { tag: migration.tag, new_sqlite_classes: created };
+  });
+}
+
 export function normalizeProjectSlug(value) {
   const slug = value === undefined ? '' : value;
   assert(typeof slug === 'string' && !/[^a-zA-Z0-9_-]/.test(slug), 'Expected an optional, valid Infisical project slug');
@@ -106,6 +146,11 @@ export function prepare(payload, project) {
   const resourceNames = new Set([assetBinding]);
   for (const environment of Object.values(project.environments)) for (const name of resourceBindingNames(environment.bindings)) resourceNames.add(name);
   assert(project.runtime_secrets.every(name => !resourceNames.has(name)), 'Runtime secret name collides with a Worker resource binding');
+  validatePreviewMigrations(project.preview_migrations, {
+    nativePreview: project.preview_mode === 'native', target,
+    previewBindings: project.environments.staging?.bindings,
+    productionBindings: project.environments.production.bindings,
+  });
   assertNoInfisicalValues(project, slug);
   const environment = project.environments[target];
   return { repo: payload.repo, branch: payload.branch, sha: payload.sha, source_run_url: payload.source_run_url, owner, repo_name, project, target, infisical_project_slug: slug, infisical_env: environment.infisical_env, infisical_path: environment.infisical_path };
@@ -130,7 +175,14 @@ export function sanitizeConfig(config, plan) {
   const p = plan.project;
   assert(config.name === p.worker_name && config.account_id === p.account_id, 'Built account or Worker differs from registered destination');
   assert(config.targetEnvironment === undefined || config.targetEnvironment === plan.target, 'Wrong build target');
-  for (const key of ['build', 'alias', 'env', 'migrations', 'unsafe', 'containers']) assert(empty(config[key]), `Unsupported generated config: ${key}`);
+  for (const key of ['build', 'alias', 'env', 'unsafe', 'containers']) assert(empty(config[key]), `Unsupported generated config: ${key}`);
+  const migrationContext = {
+    nativePreview: p.preview_mode === 'native', target: plan.target,
+    previewBindings: p.environments.staging?.bindings,
+    productionBindings: p.environments.production.bindings,
+  };
+  const migrations = validatePreviewMigrations(p.preview_migrations, migrationContext);
+  assert(isDeepStrictEqual(validatePreviewMigrations(config.migrations, migrationContext), migrations), 'Generated Durable Object migrations differ from source configuration');
   assert(config.no_bundle === true, 'Vinext must emit a prebuilt no_bundle Worker');
   assert(config.workers_dev === true && config.preview_urls === true, 'Enable workers_dev and preview_urls');
   assert(typeof config.main === 'string' && /\.(m?js)$/.test(config.main), 'Missing built Worker entry');
@@ -151,6 +203,7 @@ export function sanitizeConfig(config, plan) {
     if (generated[key] !== undefined) result[key] = generated[key];
   }
   result.no_bundle = true;
+  if (migrations.length) result.migrations = migrations;
   if (p.preview_mode === 'native') {
     assert(config.vars === undefined || (config.vars && typeof config.vars === 'object' && !Array.isArray(config.vars) && Object.keys(config.vars).length === 0), 'Generated native Preview config must not declare plaintext vars');
     assert(isDeepStrictEqual(config.previews && deploymentBindings(config.previews), deploymentBindings(p.preview_config)), 'Generated Preview configuration differs from source');
