@@ -5,7 +5,7 @@ Dispatches and source submodule URLs accept only `Jenin82`; helper downloads
 must stay pinned to the central run SHA in `Jenin82/ci-cd`. Source
 `wrangler.jsonc` owns destinations and bindings. Preserve build credential
 isolation, Worker serialization, Preview verification, and D1 artifact checks.
-Preview Durable Object migrations are source-owned SQLite creates only, staging-only; preserve the production rejection and exact artifact/source comparison.
+Preview Durable Object migrations remain staging-only. Separate `env.production.migrations` may create only distinct local production SQLite classes; preserve class isolation, target selection, source placement, and both artifact comparison passes.
 See `docs/vinext-deployment.md`. Check workflow YAML, inline shell syntax,
 and JavaScript syntax when updating this runner.
 

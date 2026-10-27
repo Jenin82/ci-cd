@@ -39,27 +39,26 @@ function resourceBindingNames(bindings) {
   return names;
 }
 
-// Native Previews create their own namespaces. Only additive SQLite class
-// creation is supported here; production Durable Object rollout is separate.
-export function validatePreviewMigrations(migrations, { nativePreview, target, previewBindings, productionBindings }) {
+// Both target contracts permit only additive local SQLite class creation.
+// Their bound classes remain isolated across production and native Previews.
+function validateSqliteCreates(migrations, bindings, otherBindings, scope) {
   if (migrations === undefined) return [];
   assert(Array.isArray(migrations) && migrations.length <= 100, 'Durable Object migrations must be an array of at most 100 entries');
   if (!migrations.length) return [];
-  assert(nativePreview && target === 'staging', 'Durable Object migrations are supported only for native staging Previews');
-  const bindings = previewBindings?.durable_objects?.bindings;
-  assert(Array.isArray(bindings) && bindings.length > 0, 'Durable Object migrations require Preview bindings');
+  bindings = bindings?.durable_objects?.bindings;
+  assert(Array.isArray(bindings) && bindings.length > 0, `Durable Object migrations require ${scope} bindings`);
   const names = new Set(), boundClasses = new Set();
   for (const binding of bindings) {
     assert(binding && typeof binding === 'object' && !Array.isArray(binding) &&
       Object.keys(binding).every(key => ['name', 'class_name'].includes(key)) &&
       /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(binding.name ?? '') &&
       /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(binding.class_name ?? ''),
-    'Migrated Preview Durable Objects must use local name/class_name bindings without imported scripts or namespaces');
-    assert(!names.has(binding.name), 'Duplicate Preview Durable Object binding');
+    `Migrated ${scope} Durable Objects must use local name/class_name bindings without imported scripts or namespaces`);
+    assert(!names.has(binding.name), `Duplicate ${scope} Durable Object binding`);
     names.add(binding.name);
     boundClasses.add(binding.class_name);
   }
-  const productionClasses = new Set((productionBindings?.durable_objects?.bindings ?? []).map(binding => binding.class_name));
+  const otherClasses = new Set((otherBindings?.durable_objects?.bindings ?? []).map(binding => binding.class_name));
   const tags = new Set(), classes = new Set();
   return migrations.map(migration => {
     assert(migration && typeof migration === 'object' && !Array.isArray(migration) &&
@@ -67,16 +66,31 @@ export function validatePreviewMigrations(migrations, { nativePreview, target, p
     'Only tag and new_sqlite_classes are supported in Preview Durable Object migrations');
     assert(typeof migration.tag === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(migration.tag) && !tags.has(migration.tag), 'Invalid or duplicate Preview Durable Object migration tag');
     tags.add(migration.tag);
-    assert(Array.isArray(migration.new_sqlite_classes) && migration.new_sqlite_classes.length > 0 && migration.new_sqlite_classes.length <= 100, 'Each Preview migration must create 1-100 SQLite Durable Object classes');
+    assert(Array.isArray(migration.new_sqlite_classes) && migration.new_sqlite_classes.length > 0 && migration.new_sqlite_classes.length <= 100, `Each ${scope} migration must create 1-100 SQLite Durable Object classes`);
     const created = migration.new_sqlite_classes.map(name => {
       assert(typeof name === 'string' && /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(name) &&
-        boundClasses.has(name) && !classes.has(name) && !productionClasses.has(name),
-      'Migrated classes must be unique, locally bound Preview classes absent from production');
+        boundClasses.has(name) && !classes.has(name) && !otherClasses.has(name),
+      `Migrated classes must be unique, locally bound ${scope} classes absent from ${scope === 'Preview' ? 'production' : 'Previews'}`);
       classes.add(name);
       return name;
     });
     return { tag: migration.tag, new_sqlite_classes: created };
   });
+}
+
+export function validatePreviewMigrations(migrations, { nativePreview, target, previewBindings, productionBindings }) {
+  if (migrations === undefined) return [];
+  // Keep this API staging-only. A production dispatch validates the declaration
+  // with an explicit staging context, then selects a separate production list.
+  if (Array.isArray(migrations) && migrations.length === 0) return [];
+  assert(nativePreview && target === 'staging', 'Durable Object migrations are supported only for native staging Previews');
+  return validateSqliteCreates(migrations, previewBindings, productionBindings, 'Preview');
+}
+
+export function validateProductionMigrations(migrations, { nativePreview, target, previewBindings, productionBindings }) {
+  if (migrations === undefined || (Array.isArray(migrations) && migrations.length === 0)) return [];
+  assert(nativePreview && target === 'production', 'Production Durable Object migrations require a native production deployment');
+  return validateSqliteCreates(migrations, productionBindings, previewBindings, 'production');
 }
 
 export function normalizeProjectSlug(value) {
@@ -147,7 +161,12 @@ export function prepare(payload, project) {
   for (const environment of Object.values(project.environments)) for (const name of resourceBindingNames(environment.bindings)) resourceNames.add(name);
   assert(project.runtime_secrets.every(name => !resourceNames.has(name)), 'Runtime secret name collides with a Worker resource binding');
   validatePreviewMigrations(project.preview_migrations, {
-    nativePreview: project.preview_mode === 'native', target,
+    nativePreview: project.preview_mode === 'native', target: 'staging',
+    previewBindings: project.environments.staging?.bindings,
+    productionBindings: project.environments.production.bindings,
+  });
+  validateProductionMigrations(project.production_migrations, {
+    nativePreview: project.preview_mode === 'native', target: 'production',
     previewBindings: project.environments.staging?.bindings,
     productionBindings: project.environments.production.bindings,
   });
@@ -177,12 +196,21 @@ export function sanitizeConfig(config, plan) {
   assert(config.targetEnvironment === undefined || config.targetEnvironment === plan.target, 'Wrong build target');
   for (const key of ['build', 'alias', 'env', 'unsafe', 'containers']) assert(empty(config[key]), `Unsupported generated config: ${key}`);
   const migrationContext = {
-    nativePreview: p.preview_mode === 'native', target: plan.target,
+    nativePreview: p.preview_mode === 'native', target: 'staging',
     previewBindings: p.environments.staging?.bindings,
     productionBindings: p.environments.production.bindings,
   };
-  const migrations = validatePreviewMigrations(p.preview_migrations, migrationContext);
-  assert(isDeepStrictEqual(validatePreviewMigrations(config.migrations, migrationContext), migrations), 'Generated Durable Object migrations differ from source configuration');
+  const previewMigrations = validatePreviewMigrations(p.preview_migrations, migrationContext);
+  const productionMigrations = validateProductionMigrations(p.production_migrations, { ...migrationContext, target: 'production' });
+  const migrations = plan.target === 'staging' ? previewMigrations : productionMigrations;
+  // A raw production build without env.production.migrations inherits the
+  // top-level Preview declaration. Verify it exactly, then strip it. Artifacts
+  // and explicit production overrides must contain only the selected list.
+  const inheritedPreview = p.preview_mode === 'native' && plan.target === 'production' &&
+    config.targetEnvironment !== undefined && !p.production_migrations_declared;
+  const generatedContext = inheritedPreview || plan.target === 'staging' ? migrationContext : { ...migrationContext, target: 'production' };
+  const validator = inheritedPreview || plan.target === 'staging' ? validatePreviewMigrations : validateProductionMigrations;
+  assert(isDeepStrictEqual(validator(config.migrations, generatedContext), inheritedPreview ? previewMigrations : migrations), 'Generated Durable Object migrations differ from source configuration');
   assert(config.no_bundle === true, 'Vinext must emit a prebuilt no_bundle Worker');
   assert(config.workers_dev === true && config.preview_urls === true, 'Enable workers_dev and preview_urls');
   assert(typeof config.main === 'string' && /\.(m?js)$/.test(config.main), 'Missing built Worker entry');
@@ -195,6 +223,8 @@ export function sanitizeConfig(config, plan) {
   const bindingTarget = p.preview_mode === 'native' && config.targetEnvironment === undefined ? 'production' : plan.target;
   const expected = deploymentBindings(p.environments[bindingTarget].bindings);
   const generated = deploymentBindings(config);
+  const expectedPlacement = p.environments[bindingTarget].placement;
+  assert(isDeepStrictEqual(config.placement, expectedPlacement), `Unexpected ${bindingTarget} placement`);
   for (const key of bindingKeys) {
     assert(isDeepStrictEqual(generated[key], expected[key]) || (empty(generated[key]) && empty(expected[key])), `Unexpected ${bindingTarget} resource binding: ${key}`);
   }
@@ -213,6 +243,8 @@ export function sanitizeConfig(config, plan) {
       else result[key] = production[key];
     }
     result.previews = deploymentBindings(p.preview_config);
+    if (p.environments.production.placement === undefined) delete result.placement;
+    else result.placement = p.environments.production.placement;
   } else {
     assert(empty(config.previews), 'Legacy alias build must not configure native Previews');
   }

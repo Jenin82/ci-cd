@@ -3,7 +3,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, write
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { prepare, sanitizeConfig } from '../scripts/vinext/config.mjs';
+import { prepare, sanitizeConfig, validatePreviewMigrations } from '../scripts/vinext/config.mjs';
 import { projectFromSource } from '../scripts/vinext/source.mjs';
 import { build, validateBundle } from '../scripts/vinext/build.mjs';
 import { deploymentArgs } from '../scripts/vinext/deploy.mjs';
@@ -103,13 +103,20 @@ for (const scope of ['top-level', 'production environment']) {
   });
 }
 
-test('nonempty migrations are rejected for production dispatch and direct production plans', () => {
+test('Preview validator remains staging-only while native main builds strip inherited Preview migrations', () => {
   const { payload, source } = fixture();
-  assert.throws(() => planFor({ ...payload, branch: 'main' }, source), /only for native staging/);
   const project = projectFromSource(payload, source, {});
-  assert.throws(() => prepare({ ...payload, branch: 'main' }, project), /only for native staging/);
-  const plan = planFor(payload, source);
-  assert.throws(() => sanitizeConfig(generated(source, 'production'), { ...plan, target: 'production' }), /only for native staging/);
+  assert.throws(() => validatePreviewMigrations(migrations, {
+    nativePreview: true, target: 'production', previewBindings: project.environments.staging.bindings,
+    productionBindings: project.environments.production.bindings,
+  }), /only for native staging/);
+  const plan = planFor({ ...payload, branch: 'main' }, source);
+  const output = sanitizeConfig(generated(source, 'production'), plan);
+  assert.equal(output.migrations, undefined);
+  assert.equal(output.durable_objects, undefined);
+  assert.deepEqual(sanitizeConfig(output, plan), output);
+  const artifactWithPreviewMigrations = { ...output, migrations };
+  assert.throws(() => sanitizeConfig(artifactWithPreviewMigrations, plan), /require production bindings/);
 });
 
 test('nonempty migrations are rejected for legacy alias deployment', () => {

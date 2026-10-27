@@ -73,14 +73,48 @@ The runner captures the exact source migration list, compares generated files
 against it during build and deploy, and retains it at the sanitized bundle's top
 level for `wrangler preview --name stg --ignore-base-config`. Cloudflare applies
 these migrations to the Preview's isolated namespaces. Production resource
-binding restoration is unchanged. Nonempty Durable Object migrations are
-rejected for production and legacy alias deployments; a future production
-Durable Object rollout needs separate support. Existing projects without such
-migrations keep their deployment behavior.
+binding restoration is unchanged. The Preview validator rejects production and
+legacy alias contexts. A `main` build can still read a source containing Preview
+migrations: its first pass verifies inherited declarations and removes them from
+the production artifact. Existing projects without production migrations retain
+their deployment behavior.
 
-Run `node --test tests/vinext-preview-migrations.test.mjs` for the configuration
+Run `node --test tests/vinext-*.test.mjs` for the configuration
 and artifact regressions. The same six control modules remain the complete
 workflow download set.
+
+## Separate production Durable Object migrations
+
+Native Preview projects may opt into production SQLite class creation only in
+`env.production.migrations`. Declare distinct production classes in the source's
+production bindings (top level and the matching `env.production` build override):
+
+```json
+{
+  "env": {
+    "production": {
+      "migrations": [{ "tag": "vkg-prod-mail-v1", "new_sqlite_classes": ["ProductionMailDispatcher"] }],
+      "placement": { "region": "aws:ap-southeast-1" }
+    }
+  }
+}
+```
+
+Production creates must bind local production classes absent from the Preview.
+The same limits and prohibitions on rename/delete/transfer/imported namespaces
+apply as for Preview creates. Keep `MailDispatcher` and
+`ProductionMailDispatcher` separate; declarations for one target never authorize
+migration actions for the other. Explicit `env.production.migrations: []` opts
+out of inherited Preview migrations. Preview overrides belong only at the top
+level; `env.staging.migrations` is rejected to avoid ambiguous inheritance.
+
+Build and deploy validate the exact selected list, including on the second
+sanitization pass. Production uses only the production list; staging uses only
+the Preview list. Environment placement is likewise source-owned, verified in
+raw builds and artifacts, and the sanitized native bundle restores production
+placement at top level while retaining the isolated `previews.placement`.
+These contracts prepare future deployments; changing them does not create
+namespaces or activate any database until an authorized deployment runs.
 
 ## D1 migrations
 

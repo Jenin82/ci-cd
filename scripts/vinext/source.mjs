@@ -1,4 +1,4 @@
-import { assert, bindingKeys, nonemptyValues, validateDispatch, validatePreviewMigrations } from './config.mjs';
+import { assert, bindingKeys, nonemptyValues, validateDispatch, validatePreviewMigrations, validateProductionMigrations } from './config.mjs';
 
 const noPlainVars = source => source.vars === undefined || (source.vars && typeof source.vars === 'object' && !Array.isArray(source.vars) && Object.keys(source.vars).length === 0);
 
@@ -106,7 +106,7 @@ export function projectFromSource(payload, { pkg, wrangler, submodule_repos }, v
     if (nativePreview) assert(noPlainVars(source), 'Native Preview source environments must not declare plaintext vars; use Infisical');
     assert(source.name === topName && (source.account_id ?? topAccount) === topAccount, 'All source environments must target the same Worker and account');
     const bindings = Object.fromEntries(bindingKeys.filter(key => source[key] !== undefined).map(key => [key, source[key]]));
-    environments[target] = { infisical_env, infisical_path: '/', bindings };
+    environments[target] = { infisical_env, infisical_path: '/', bindings, ...((source.placement ?? wrangler.placement) === undefined ? {} : { placement: source.placement ?? wrangler.placement }) };
   }
   const target = payload.branch === 'main' ? 'production' : 'staging';
   assert(environments[target], `Source Wrangler has no ${target} environment`);
@@ -119,12 +119,17 @@ export function projectFromSource(payload, { pkg, wrangler, submodule_repos }, v
     environments.production.bindings = productionBindings;
   }
   const previewMigrations = validatePreviewMigrations(wrangler.migrations, {
-    nativePreview, target, previewBindings: environments.staging?.bindings,
+    nativePreview, target: 'staging', previewBindings: environments.staging?.bindings,
     productionBindings: { durable_objects: { bindings: [
       ...(wrangler.durable_objects?.bindings ?? []),
       ...(wrangler.env?.production?.durable_objects?.bindings ?? []),
     ] } },
   });
+  const productionMigrations = validateProductionMigrations(wrangler.env?.production?.migrations, {
+    nativePreview, target: 'production', previewBindings: environments.staging?.bindings,
+    productionBindings: environments.production?.bindings,
+  });
+  assert(wrangler.env?.staging?.migrations === undefined, 'Preview migrations must use the top-level declaration');
   return {
     account_id: topAccount, worker_name: topName, node_version: '24',
     asset_binding: wrangler.assets?.binding ?? 'ASSETS',
@@ -135,6 +140,8 @@ export function projectFromSource(payload, { pkg, wrangler, submodule_repos }, v
     preview_mode: nativePreview ? 'native' : 'alias', preview_name: nativePreview ? 'stg' : undefined,
     preview_config: nativePreview ? wrangler.previews : undefined,
     ...(previewMigrations.length ? { preview_migrations: previewMigrations } : {}),
+    ...(productionMigrations.length ? { production_migrations: productionMigrations } : {}),
+    production_migrations_declared: wrangler.env?.production?.migrations !== undefined,
     environments,
   };
 }
